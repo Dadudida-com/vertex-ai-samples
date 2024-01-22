@@ -41,6 +41,7 @@ from utils import NotebookProcessors, util
 
 # A buffer so that workers finish before the orchestrating job
 WORKER_TIMEOUT_BUFFER_IN_SECONDS: int = 60 * 60
+
 PYTHON_VERSION = "3.9"  # Set default python version
 
 # rolling time window for accumulating build results for selecting notebooks
@@ -120,7 +121,7 @@ def load_results(results_bucket: str,
                 if notebook in accumulative_results:
                     accumulative_results[notebook]['passed'] += build_results[notebook]['passed']
                     accumulative_results[notebook]['failed'] += build_results[notebook]['failed']
-                    if accumulative_results[notebook]['last_time_ran'] > time_created:
+                    if accumulative_results[notebook]['last_time_ran'] < time_created:
                         accumulative_results[notebook]['last_time_ran'] = time_created
                 else:
                     accumulative_results[notebook] = build_results[notebook]
@@ -270,7 +271,7 @@ def process_and_execute_notebook(
     private_pool_id: Optional[str],
     deadline: datetime.datetime,
     notebook: str,
-    should_get_tail_logs: bool = False,
+    should_get_tail_logs: bool = True,
 ) -> NotebookExecutionResult:
 
     print(f"Running notebook: {notebook}")
@@ -452,15 +453,39 @@ def _save_results(results: List[NotebookExecutionResult],
         else:
             pass_count = 0
             fail_count = 1
+        if result.error_message is None:
+            error_type = ''
+        elif '500 Internal' in result.error_message or 'INTERNAL' in result.error_message or 'internal error' in result.error_message:
+            error_type = 'INTERNAL'
+        elif 'context deadline exceeded' in result.error_message or 'TIMEOUT' in result.error_message:
+            error_type = 'TIMEOUT'
+        elif 'Quota' in result.error_message or 'quotas are exceeded' in result.error_message:
+            error_type = 'QUOTA'
+        elif 'ServiceUnavailable' in result.error_message:
+            error_type = 'SERVICEUNAVAILABLE'
+        elif 'ModuleNotFoundError' in result.error_message:
+            error_type = 'IMPORT'
+        elif result.is_pass:
+            error_type = ''
+        else:
+            error_type = 'undetermined'
+
+        if error_type != '':
+            log_url = result.log_url
+        else:
+            log_url = ''
+
         build_results[result.path] = {
                 'duration': result.duration.total_seconds(),
                 'start_time': str(result.start_time),
                 'passed': pass_count,
-                'failed': fail_count
+                'failed': fail_count,
+                'error_type': error_type,
+                'log_url': log_url
         }
         print(f"adding {result.path}")
 
-    print("Saving accumulative results ...")
+    print(f"Saving accumulative results to {results_file}, nentries {len(build_results)}")
     content = json.dumps(build_results)
 
     client = storage.Client()
@@ -483,6 +508,7 @@ def process_and_execute_notebooks(
     variable_vpc_network: Optional[str] = None,
     private_pool_id: Optional[str] = None,
     concurrent_notebooks: Optional[int] = 10,
+    aiplatform_whl: Optional[str] = None,
 ):
     """
     Run the notebooks that exist under the folders defined in the test_paths_file.
@@ -514,6 +540,7 @@ def process_and_execute_notebooks(
         timeout (str):
             Required. Timeout string according to https://cloud.google.com/build/docs/build-config-file-schema#timeout.
         concurrent_notebooks (int): Max number of notebooks per minute to run in parallel.
+        aiplatform_whl: alternate whl version of Vertex AI SDK to install
     """
 
     # Calculate deadline
